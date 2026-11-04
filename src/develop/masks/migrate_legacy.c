@@ -1075,6 +1075,8 @@ typedef struct _pending_flexi_migration_t
   // not a migration but the forms a stored blend params blob carried
   // (dt_masks_import_stored_forms()), to add under fresh ids
   GList *forms;
+  // borrowed from the history item, which outlives this pending import
+  void *owned_params;
 } _pending_flexi_migration_t;
 
 void dt_masks_migrate_classic_to_flexi(dt_iop_module_t *module,
@@ -1175,6 +1177,193 @@ static GHashTable *_stored_form_ids(const dt_develop_t *dev)
   return ids;
 }
 
+static gboolean _remap_owned_params(dt_iop_module_t *module, GHashTable *ids)
+{
+  if(!module->get_f || !module->params) return FALSE;
+  // only these modules store shape ids in op_params; introspection supplies
+  // the current offsets without treating every NO_MASKS module alike
+  const char *array_name = NULL;
+  const char *id_name = NULL;
+  if(dt_iop_module_is(module, "retouch"))
+  {
+    array_name = "rt_forms";
+    id_name = "formid";
+  }
+  else if(dt_iop_module_is(module, "spots"))
+    array_name = "clone_id";
+  else
+    return FALSE;
+
+  const dt_introspection_field_t *array = module->get_f(array_name);
+  if(!array || array->header.type != DT_INTROSPECTION_TYPE_ARRAY
+     || !array->Array.field) return FALSE;
+  const dt_introspection_field_t *element = array->Array.field;
+  size_t offset = 0;
+  if(id_name)
+  {
+    if(element->header.type != DT_INTROSPECTION_TYPE_STRUCT) return FALSE;
+    gboolean found = FALSE;
+    for(size_t i = 0; i < element->Struct.entries; i++)
+    {
+      const dt_introspection_field_t *field = element->Struct.fields[i];
+      if(field->header.field_name && !strcmp(field->header.field_name, id_name)
+         && field->header.type == DT_INTROSPECTION_TYPE_INT
+         && field->header.size == sizeof(dt_mask_id_t))
+      {
+        if(field->header.offset < element->header.offset) return FALSE;
+        offset = field->header.offset - element->header.offset;
+        found = TRUE;
+        break;
+      }
+    }
+    if(!found) return FALSE;
+  }
+  else if(element->header.type != DT_INTROSPECTION_TYPE_INT
+          || element->header.size != sizeof(dt_mask_id_t))
+    return FALSE;
+
+  if(!element->header.size || array->header.offset > module->params_size
+     || array->header.size > module->params_size - array->header.offset
+     || element->header.size < offset + sizeof(dt_mask_id_t)
+     || array->Array.count > array->header.size / element->header.size)
+    return FALSE;
+
+  for(size_t i = 0; i < array->Array.count; i++)
+  {
+    dt_mask_id_t *id = (dt_mask_id_t *)((uint8_t *)module->params + array->header.offset
+                                   + i * element->header.size + offset);
+    if(dt_is_valid_maskid(*id)
+       && !g_hash_table_contains(ids, GINT_TO_POINTER(*id)))
+      return FALSE;
+  }
+  for(size_t i = 0; i < array->Array.count; i++)
+  {
+    dt_mask_id_t *id = (dt_mask_id_t *)((uint8_t *)module->params + array->header.offset
+                                   + i * element->header.size + offset);
+    if(dt_is_valid_maskid(*id))
+      *id = GPOINTER_TO_INT(g_hash_table_lookup(ids, GINT_TO_POINTER(*id)));
+  }
+  return TRUE;
+}
+
+// preserve the old ids until both the tree and its module references can be
+// updated; validation must happen before queueing or publishing any forms
+static gboolean _remap_owned_forms(dt_iop_module_t *module,
+                                   dt_develop_blend_params_t *bp,
+                                   GList *forms, GList *existing, GHashTable *taken)
+{
+  GHashTable *ids = g_hash_table_new(NULL, NULL);
+  for(GList *l = forms; l; l = l->next)
+  {
+    dt_masks_form_t *f = l->data;
+    g_hash_table_insert(ids, GINT_TO_POINTER(f->formid), GINT_TO_POINTER(f->formid));
+  }
+  gboolean valid = _remap_owned_params(module, ids);
+  if(valid)
+  {
+    GList *old = NULL;
+    for(GList *l = forms; l; l = l->next)
+      old = g_list_prepend(old, GINT_TO_POINTER(((dt_masks_form_t *)l->data)->formid));
+    old = g_list_reverse(old);
+    dt_masks_blend_blob_remap(forms, bp, existing, taken);
+    for(GList *a = old, *b = forms; a; a = a->next, b = b->next)
+      g_hash_table_insert(ids, a->data, GINT_TO_POINTER(((dt_masks_form_t *)b->data)->formid));
+    valid = _remap_owned_params(module, ids);
+    g_list_free(old);
+  }
+  g_hash_table_destroy(ids);
+  return valid;
+}
+
+// owned trees can contain nested drawn groups, but no raster dependencies,
+// pixel sidecars, dangling members or cycles that cannot be reused elsewhere
+static gboolean _owned_tree_valid(GList *forms, dt_mask_id_t id, GHashTable *path, int depth, gboolean owned)
+{
+  const int cached = GPOINTER_TO_INT(g_hash_table_lookup(path, GINT_TO_POINTER(id)));
+  if(depth > DT_MASKS_NESTING_MAX || cached == -1) return FALSE;
+  // cache subtree height, rather than just "visited", so shared subtrees
+  // reached by a longer path still obey the nesting bound
+  if(cached > 0) return depth + cached - 1 <= DT_MASKS_NESTING_MAX;
+  dt_masks_form_t *form = dt_masks_get_from_id_ext(forms, id);
+  if(!form || (owned && (form->type & (DT_MASKS_PIXEL_FORMS | DT_MASKS_RASTER | DT_MASKS_PARAMETRIC))))
+    return FALSE;
+  if(!(form->type & DT_MASKS_GROUP))
+  {
+    g_hash_table_insert(path, GINT_TO_POINTER(id), GINT_TO_POINTER(1));
+    return TRUE;
+  }
+  g_hash_table_insert(path, GINT_TO_POINTER(id), GINT_TO_POINTER(-1));
+  gboolean valid = TRUE;
+  int height = 0;
+  for(GList *p = form->points; p && valid; p = p->next)
+  {
+    const dt_masks_point_group_t *pt = p->data;
+    valid = pt->parentid == id;
+    if(valid && !dt_masks_point_is_marker(pt))
+    {
+      valid = _owned_tree_valid(forms, pt->formid, path, depth + 1, owned);
+      if(valid)
+        height = MAX(height, GPOINTER_TO_INT(g_hash_table_lookup(path, GINT_TO_POINTER(pt->formid))));
+    }
+  }
+  if(depth + height > DT_MASKS_NESTING_MAX) valid = FALSE;
+  if(valid) g_hash_table_insert(path, GINT_TO_POINTER(id), GINT_TO_POINTER(height + 1));
+  return valid;
+}
+
+gboolean dt_masks_import_owned_forms(dt_iop_module_t *module,
+                                      dt_develop_blend_params_t *bp,
+                                      GList *forms, const int history_num)
+{
+  if(!module || !module->dev || (!dt_iop_module_is(module, "retouch")
+                     && !dt_iop_module_is(module, "spots")))
+  {
+    g_list_free_full(forms, (GDestroyNotify)dt_masks_free_form);
+    return FALSE;
+  }
+  // a deferred import must validate now, while failure can still reject the
+  // history row; its params buffer remains alive until migrations finish
+  GHashTable *ids = g_hash_table_new(NULL, NULL);
+  GList *owned = dt_masks_tree_forms(forms, bp->mask_id);
+  for(GList *l = owned; l; l = l->next)
+  {
+    const dt_mask_id_t id = ((dt_masks_form_t *)l->data)->formid;
+    g_hash_table_insert(ids, GINT_TO_POINTER(id), GINT_TO_POINTER(id));
+  }
+  g_list_free(owned);
+  GHashTable *path = g_hash_table_new(NULL, NULL);
+  gboolean valid = _owned_tree_valid(forms, bp->mask_id, path, 0, TRUE);
+  g_hash_table_remove_all(path);
+  if(valid && dt_is_valid_maskid(bp->blend_mask_id))
+    valid = _owned_tree_valid(forms, bp->blend_mask_id, path, 0, FALSE);
+  valid = valid && _remap_owned_params(module, ids);
+  g_hash_table_destroy(path);
+  g_hash_table_destroy(ids);
+  if(!valid)
+  {
+    g_list_free_full(forms, (GDestroyNotify)dt_masks_free_form);
+    return FALSE;
+  }
+  if(history_num >= 0)
+  {
+    _pending_flexi_migration_t *pending = calloc(1, sizeof(*pending));
+    pending->module = module;
+    pending->bp = bp;
+    pending->forms = forms;
+    pending->owned_params = module->params;
+    module->dev->pending_flexi_migrations =
+      g_list_append(module->dev->pending_flexi_migrations, pending);
+    return TRUE;
+  }
+  if(!_remap_owned_forms(module, bp, forms, module->dev->forms, NULL))
+  {
+    g_list_free_full(forms, (GDestroyNotify)dt_masks_free_form);
+    return FALSE;
+  }
+  module->dev->forms = g_list_concat(module->dev->forms, forms);
+  return TRUE;
+}
+
 void dt_masks_import_stored_forms(dt_iop_module_t *module,
                                   dt_develop_blend_params_t *bp,
                                   GList *forms,
@@ -1218,7 +1407,27 @@ void dt_masks_finish_flexi_migrations(dt_develop_t *dev)
     if(pending->forms)
     {
       if(!taken_ids) taken_ids = _stored_form_ids(dev);
-      dt_masks_blend_blob_remap(pending->forms, pending->bp, NULL, taken_ids);
+      if(pending->owned_params)
+      {
+        void *saved = pending->module->params;
+        pending->module->params = pending->owned_params;
+        const gboolean imported =
+          _remap_owned_forms(pending->module, pending->bp, pending->forms, NULL, taken_ids);
+        pending->module->params = saved;
+        if(!imported)
+        {
+          // a failed import must not leave references into another module's
+          // forms, even if the module's introspection changed unexpectedly
+          memcpy(pending->owned_params, pending->module->default_params,
+                 pending->module->params_size);
+          *pending->bp = *pending->module->default_blendop_params;
+          g_list_free_full(pending->forms, (GDestroyNotify)dt_masks_free_form);
+          free(pending);
+          continue;
+        }
+      }
+      else
+        dt_masks_blend_blob_remap(pending->forms, pending->bp, NULL, taken_ids);
       for(GList *f = pending->forms; f; f = g_list_next(f))
         dt_masks_write_masks_history_item(dev->image_storage.id, history_num, f->data);
       // dt_masks_read_masks_history() reads them back

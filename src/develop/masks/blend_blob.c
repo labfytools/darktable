@@ -137,6 +137,16 @@ void *dt_masks_blend_blob_encode(const dt_develop_blend_params_t *bp,
   g_byte_array_append(out, (const guint8 *)bp, sizeof(*bp));
 
   GList *tree = _carries_tree(bp, forms) ? dt_masks_tree_forms(forms, bp->mask_id) : NULL;
+  // retouch/spots keep their optional blending tree separate from their own
+  // shapes; both roots must travel together, without duplicating shared forms
+  if(tree && dt_is_valid_maskid(bp->blend_mask_id))
+  {
+    GHashTable *seen = g_hash_table_new(NULL, NULL);
+    for(GList *l = tree; l; l = l->next)
+      g_hash_table_add(seen, GINT_TO_POINTER(((dt_masks_form_t *)l->data)->formid));
+    _collect_tree(forms, bp->blend_mask_id, seen, &tree, 0);
+    g_hash_table_destroy(seen);
+  }
 
   // a form stored as pixels refers to its own image's sidecar, so on any
   // other image it would only show as missing: it is left out, and so are
@@ -354,7 +364,12 @@ void dt_masks_blend_blob_remap(GList *forms,
       pt->parentid = _map_id(map, taken, taken_ids, pt->parentid);
     }
   }
-  if(bp) bp->mask_id = _map_id(map, taken, taken_ids, bp->mask_id);
+  if(bp)
+  {
+    bp->mask_id = _map_id(map, taken, taken_ids, bp->mask_id);
+    if(dt_is_valid_maskid(bp->blend_mask_id))
+      bp->blend_mask_id = _map_id(map, taken, taken_ids, bp->blend_mask_id);
+  }
   g_hash_table_destroy(map);
 }
 

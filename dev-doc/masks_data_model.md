@@ -50,6 +50,21 @@ reads or writes it. A blob without these forms is the plain struct, as it
 was before. Applying the blob gives the forms fresh ids
 (`dt_masks_blend_blob_remap`), so two applies never share a form.
 
+Retouch and spots presets also carry their module-owned drawn tree at
+`mask_id`, plus any separate blending tree at `blend_mask_id`. Applying one
+remaps both roots and the module's `rt_forms[].formid` or `clone_id[]`
+references. Only reachable forms are saved. Owned trees with unresolved
+references, cycles or image-specific elements are rejected before import.
+
+On import autoapply, the preset first becomes a history row. Its module
+parameters must be copied or converted before importing the forms. The
+existing deferred mask-import queue keeps a borrowed pointer to that history
+item's parameters until `dt_masks_finish_flexi_migrations()`: it assigns IDs
+unused in every stored mask snapshot, updates the references, and writes the
+forms into the current snapshot before history reload. The ordinary history
+write then stores plain blending parameters and the remapped module
+parameters, so reopening does not import the preset again.
+
 An AI object stored as pixels is left out of the blob, along with the group
 members that refer to it. Its pixels are in the sidecar of the image version
 it was made on, so on any other image it could only show as missing. The

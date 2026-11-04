@@ -1032,6 +1032,14 @@ void dt_masks_import_stored_forms(struct dt_iop_module_t *module,
                                   GList *forms,
                                   const int history_num);
 
+/** internal preset/style import for retouch/spots: takes forms and remaps
+    module->params together with bp. FALSE rejects unresolved references.
+    on history read, module->params must be the history item's owned buffer,
+    alive until dt_masks_finish_flexi_migrations() */
+gboolean dt_masks_import_owned_forms(struct dt_iop_module_t *module,
+                                      struct dt_develop_blend_params_t *bp,
+                                      GList *forms, const int history_num);
+
 /** create the forms of every migration dt_masks_migrate_classic_to_flexi()
     deferred, writing them under the masks_history position
     dt_masks_read_masks_history() reads as current. Call it once

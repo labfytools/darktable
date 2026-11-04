@@ -2816,16 +2816,21 @@ void dt_dev_read_history_ext(dt_develop_t *dev,
     if(history_end_current > dev->history_end)
       hist->module->iop_order = hist->iop_order;
 
-    // the blend params, converted or migrated if need be, with any mask forms
-    // they carry (an auto-applied preset's) added under this row's num.
-    // Defaults if they cannot be read
-    gboolean blend_converted = FALSE;
-    if(dt_develop_blend_params_read(hist->module, blendop_params, bl_length, blendop_version,
-                                    hist->blend_params, num, FALSE, &blend_converted))
-      memcpy(hist->blend_params, hist->module->default_blendop_params,
-             sizeof(dt_develop_blend_params_t));
-    else if(blend_converted)
-      legacy_params = TRUE;
+    const gboolean owned_tail = (hist->module->flags() & IOP_FLAGS_NO_MASKS)
+      && bl_length > sizeof(dt_develop_blend_params_t);
+    if(!owned_tail)
+    {
+      // the blend params, converted or migrated if need be, with any mask forms
+      // they carry (an auto-applied preset's) added under this row's num.
+      // Defaults if they cannot be read
+      gboolean blend_converted = FALSE;
+      if(dt_develop_blend_params_read(hist->module, blendop_params, bl_length, blendop_version,
+                                      hist->blend_params, num, FALSE, &blend_converted))
+        memcpy(hist->blend_params, hist->module->default_blendop_params,
+               sizeof(dt_develop_blend_params_t));
+      else if(blend_converted)
+        legacy_params = TRUE;
+    }
 
     // Copy module params if valid, else try to convert legacy params
     if(param_length == 0)
@@ -2902,6 +2907,26 @@ void dt_dev_read_history_ext(dt_develop_t *dev,
         memcpy(hist->params, hist->module->default_params, hist->module->params_size);
         hist->enabled = TRUE;
       }
+    }
+
+    if(owned_tail)
+    {
+      // the blend params, converted or migrated if need be, with any mask forms
+      // they carry (an auto-applied preset's) added under this row's num.
+      // Defaults if they cannot be read
+      gboolean blend_converted = FALSE;
+      // owned-form imports must update this row's op_params, after conversion,
+      // rather than the live module buffer shared by multiple history items
+      void *saved_params = hist->module->params;
+      hist->module->params = hist->params;
+      if(dt_develop_blend_params_read(hist->module, blendop_params, bl_length, blendop_version,
+                                      hist->blend_params, num, FALSE, &blend_converted))
+        memcpy(hist->blend_params, hist->module->default_blendop_params,
+               sizeof(dt_develop_blend_params_t));
+      else if(blend_converted)
+        legacy_params = TRUE;
+
+      hist->module->params = saved_params;
     }
 
     // make sure that always-on modules are always on. duh.

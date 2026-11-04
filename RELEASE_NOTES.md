@@ -769,6 +769,9 @@ changes (where available).
   the scale pixels module was enabled: they were shrunk toward the
   top-left corner of the image instead of being stretched with it.
 
+- User presets now preserve retouch and spot removal shapes, including
+  when automatically applied to newly imported images.
+
 - Fixed styles containing retouch or spot removal shapes failing to apply
   when the target image already had shapes with the same identifiers.
 

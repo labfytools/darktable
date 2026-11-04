@@ -93,12 +93,17 @@ void dt_gui_presets_init()
 
 void *dt_gui_presets_module_blend_blob(dt_iop_module_t *module, size_t *size)
 {
-  // a module without masks references its shapes from its params: they are
-  // its content, not a mask to carry
-  GList *forms = module->dev && !(module->flags() & IOP_FLAGS_NO_MASKS)
-    ? module->dev->forms
-    : NULL;
-  return dt_masks_blend_blob_encode(module->blend_params, forms, size);
+  const gboolean owned = (module->flags() & IOP_FLAGS_NO_MASKS)
+    && (dt_iop_module_is(module, "retouch") || dt_iop_module_is(module, "spots"));
+  GList *forms = module->dev && (owned || !(module->flags() & IOP_FLAGS_NO_MASKS))
+    ? module->dev->forms : NULL;
+  // owned shapes use mask_id too; select tree encoding without changing the
+  // stored blend mode or the module's live parameters
+  dt_develop_blend_params_t bp = *module->blend_params;
+  if(owned) bp.mask_mode |= DEVELOP_MASK_FLEXI;
+  void *blob = dt_masks_blend_blob_encode(&bp, forms, size);
+  if(owned) memcpy(blob, module->blend_params, sizeof(bp));
+  return blob;
 }
 
 gboolean dt_gui_presets_confirm_pixel_masks(const char *style_modules)
